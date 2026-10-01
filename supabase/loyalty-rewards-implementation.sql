@@ -11,24 +11,14 @@ begin
     'public.menu_payment_attempts', 'public.hotel_bookings',
     'public.hotel_payment_attempts', 'public.special_event_bookings',
     'public.special_event_payments', 'public.books_organizations',
-    'public.books_menu_sales_settings', 'public.books_accounts',
-    'public.books_journal_transactions', 'public.books_fx_rates'
+    'public.books_memberships', 'public.books_menu_sales_settings',
+    'public.books_accounts', 'public.books_journal_transactions',
+    'public.books_journal_lines', 'public.books_fx_rates'
   ] loop
     if to_regclass(dependency) is null then
       raise exception 'Rewards setup stopped: required relation % is missing', dependency;
     end if;
   end loop;
-  if to_regprocedure('public.user_books_organization_ids()') is null then
-    raise exception 'Rewards setup stopped: Books membership helper is missing';
-  end if;
-  if not exists (
-    select 1 from pg_proc p
-    join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public' and p.proname = 'post_books_journal_entry'
-      and p.pronargs = 10
-  ) then
-    raise exception 'Rewards setup stopped: Books journal posting function is missing';
-  end if;
 end;
 $$;
 
@@ -151,6 +141,9 @@ create table if not exists public.loyalty_books_postings (
   updated_at timestamptz not null default now()
 );
 
+create unique index if not exists books_journal_source_unique
+  on public.books_journal_transactions (organization_id, source_type, source_id)
+  where source_id is not null;
 create index if not exists loyalty_ledger_user_recent_idx
   on public.loyalty_ledger_entries (user_id, created_at desc);
 create index if not exists loyalty_referrals_referrer_recent_idx
@@ -185,7 +178,11 @@ create policy loyalty_referrals_owner_read on public.loyalty_referrals
 drop policy if exists loyalty_books_postings_books_member_read on public.loyalty_books_postings;
 create policy loyalty_books_postings_books_member_read on public.loyalty_books_postings
   for select to authenticated
-  using (organization_id in (select public.user_books_organization_ids()));
+  using (exists (
+    select 1 from public.books_memberships membership
+     where membership.organization_id = loyalty_books_postings.organization_id
+       and membership.user_id = auth.uid()
+  ));
 
 create or replace function public.prevent_loyalty_ledger_mutation()
 returns trigger language plpgsql set search_path = pg_catalog, public
@@ -208,6 +205,8 @@ declare
   liability_account uuid;
   journal_uuid uuid;
   posting_amount numeric(20,4);
+  debit_account_uuid uuid;
+  credit_account_uuid uuid;
   debit_code text;
   credit_code text;
   expense_code text;
@@ -248,10 +247,26 @@ begin
       debit_code := liability_code;
       credit_code := expense_code;
     end if;
-    journal_uuid := public.post_books_journal_entry(
+    select id into debit_account_uuid from public.books_accounts
+     where organization_id = organization_uuid and code = debit_code;
+    select id into credit_account_uuid from public.books_accounts
+     where organization_id = organization_uuid and code = credit_code;
+    insert into public.books_journal_transactions (
+      organization_id, source_type, source_id, transaction_date, description, created_by
+    ) values (
       organization_uuid, 'loyalty_points', entry_row.id, entry_row.created_at::date,
-      entry_row.description, debit_code, credit_code, posting_amount, 'UGX', organization_owner
-    );
+      entry_row.description, organization_owner
+    ) on conflict do nothing returning id into journal_uuid;
+    if journal_uuid is null then
+      select id into journal_uuid from public.books_journal_transactions
+       where organization_id = organization_uuid and source_type = 'loyalty_points'
+         and source_id = entry_row.id;
+    else
+      insert into public.books_journal_lines (transaction_id, account_id, debit, currency_code)
+      values (journal_uuid, debit_account_uuid, posting_amount, 'UGX');
+      insert into public.books_journal_lines (transaction_id, account_id, credit, currency_code)
+      values (journal_uuid, credit_account_uuid, posting_amount, 'UGX');
+    end if;
     update public.loyalty_books_postings
        set organization_id = organization_uuid, status = 'posted',
            journal_transaction_id = journal_uuid, error_message = null, updated_at = now()
