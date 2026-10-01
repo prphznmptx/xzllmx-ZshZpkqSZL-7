@@ -1,6 +1,39 @@
 -- Loyalty rewards implementation reference. This is intentionally outside supabase/migrations.
--- Apply sections in order in Supabase SQL Editor. Review the Books organization configured
--- in books_menu_sales_settings before processing any point-liability entries.
+begin;
+
+do $$
+declare
+  dependency text;
+begin
+  foreach dependency in array array[
+    'auth.users', 'public.user_profiles', 'public.tasks', 'public.task_reports',
+    'public.notifications', 'public.hotel_rooms', 'public.menu_orders',
+    'public.menu_payment_attempts', 'public.hotel_bookings',
+    'public.hotel_payment_attempts', 'public.special_event_bookings',
+    'public.special_event_payments', 'public.books_organizations',
+    'public.books_menu_sales_settings', 'public.books_accounts',
+    'public.books_journal_transactions', 'public.books_fx_rates'
+  ] loop
+    if to_regclass(dependency) is null then
+      raise exception 'Rewards setup stopped: required relation % is missing', dependency;
+    end if;
+  end loop;
+  if to_regprocedure('public.user_books_organization_ids()') is null then
+    raise exception 'Rewards setup stopped: Books membership helper is missing';
+  end if;
+  if not exists (
+    select 1 from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'post_books_journal_entry'
+      and p.pronargs = 10
+  ) then
+    raise exception 'Rewards setup stopped: Books journal posting function is missing';
+  end if;
+end;
+$$;
+
+-- Run as one transaction in Supabase SQL Editor. Select the platform-owned UGX Books organization;
+-- do not assume a seller's organization is the correct entity for platform-funded rewards.
 -- Policy: 1 point per 1,000 UGX-equivalent eligible net spend; no points on tax, tips, or fees.
 -- Guest referrals qualify on a first paid purchase of at least UGX 100,000; manager/provider
 -- referrals qualify on a first approved task or first published hotel room. Both parties receive
@@ -18,20 +51,35 @@ create table if not exists public.loyalty_program_settings (
   task_approval_points integer not null default 50 check (task_approval_points > 0),
   monthly_task_points_cap integer not null default 500 check (monthly_task_points_cap > 0),
   ugx_value_per_point numeric(20,4) not null default 10 check (ugx_value_per_point > 0),
+  books_expense_account_code text not null default '5105' check (length(trim(books_expense_account_code)) between 1 and 32),
+  books_liability_account_code text not null default '2600' check (length(trim(books_liability_account_code)) between 1 and 32 and books_liability_account_code <> books_expense_account_code),
   books_organization_id uuid references public.books_organizations(id) on delete restrict,
   program_enabled boolean not null default false,
   redemption_enabled boolean not null default false,
   points_expire boolean not null default false,
   updated_at timestamptz not null default now()
 );
+alter table public.loyalty_program_settings add column if not exists points_per_1000_ugx integer not null default 1;
+alter table public.loyalty_program_settings add column if not exists guest_referral_minimum_ugx numeric(20,4) not null default 100000;
+alter table public.loyalty_program_settings add column if not exists referrer_bonus_points integer not null default 250;
+alter table public.loyalty_program_settings add column if not exists invitee_bonus_points integer not null default 250;
+alter table public.loyalty_program_settings add column if not exists task_approval_points integer not null default 50;
+alter table public.loyalty_program_settings add column if not exists monthly_task_points_cap integer not null default 500;
+alter table public.loyalty_program_settings add column if not exists ugx_value_per_point numeric(20,4) not null default 10;
+alter table public.loyalty_program_settings add column if not exists books_expense_account_code text not null default '5105';
+alter table public.loyalty_program_settings add column if not exists books_liability_account_code text not null default '2600';
 alter table public.loyalty_program_settings add column if not exists books_organization_id uuid references public.books_organizations(id) on delete restrict;
 alter table public.loyalty_program_settings add column if not exists program_enabled boolean not null default false;
+alter table public.loyalty_program_settings add column if not exists redemption_enabled boolean not null default false;
+alter table public.loyalty_program_settings add column if not exists points_expire boolean not null default false;
+alter table public.loyalty_program_settings add column if not exists updated_at timestamptz not null default now();
 insert into public.loyalty_program_settings (id) values (true) on conflict (id) do nothing;
 
 create table if not exists public.loyalty_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
   referral_code text not null unique,
   is_enrolled boolean not null default false,
+  enrolled_at timestamptz,
   signup_referral_code text,
   available_points bigint not null default 0 check (available_points >= 0),
   debt_points bigint not null default 0 check (debt_points >= 0),
@@ -42,6 +90,7 @@ create table if not exists public.loyalty_accounts (
 );
 alter table public.loyalty_accounts add column if not exists is_enrolled boolean not null default false;
 alter table public.loyalty_accounts alter column is_enrolled set default false;
+alter table public.loyalty_accounts add column if not exists enrolled_at timestamptz;
 alter table public.loyalty_accounts add column if not exists signup_referral_code text;
 
 create table if not exists public.loyalty_ledger_entries (
@@ -161,52 +210,58 @@ declare
   posting_amount numeric(20,4);
   debit_code text;
   credit_code text;
+  expense_code text;
+  liability_code text;
 begin
   select * into entry_row from public.loyalty_ledger_entries where id = target_entry_id;
   if not found then return; end if;
 
-  select books_organization_id into organization_uuid from public.loyalty_program_settings where id = true;
+  select books_organization_id, books_expense_account_code, books_liability_account_code
+    into organization_uuid, expense_code, liability_code
+    from public.loyalty_program_settings where id = true;
   posting_amount := abs(entry_row.points_delta) * (select ugx_value_per_point from public.loyalty_program_settings where id = true);
   insert into public.loyalty_books_postings (ledger_entry_id, organization_id, amount_ugx, status)
   values (entry_row.id, organization_uuid, posting_amount, 'pending')
   on conflict (ledger_entry_id) do nothing;
   if organization_uuid is null then return; end if;
 
-  select owner_id into organization_owner from public.books_organizations where id = organization_uuid;
-  if organization_owner is null then raise exception 'The loyalty Books organization is unavailable'; end if;
-  insert into public.books_accounts (organization_id, code, name, type, is_system)
-  values
-    (organization_uuid, '5105', 'Loyalty rewards expense', 'expense', true),
-    (organization_uuid, '2600', 'Loyalty points liability', 'liability', true)
-  on conflict (organization_id, code) do nothing;
-  select id into expense_account from public.books_accounts
-    where organization_id = organization_uuid and code = '5105' and type = 'expense';
-  select id into liability_account from public.books_accounts
-    where organization_id = organization_uuid and code = '2600' and type = 'liability';
-  if expense_account is null or liability_account is null then
-    raise exception 'The loyalty expense or liability account is configured with an incompatible account type';
-  end if;
+  begin
+    select owner_id into organization_owner from public.books_organizations where id = organization_uuid;
+    if organization_owner is null then raise exception 'The loyalty Books organization is unavailable'; end if;
+    insert into public.books_accounts (organization_id, code, name, type, is_system)
+    values
+      (organization_uuid, expense_code, 'Loyalty rewards expense', 'expense', true),
+      (organization_uuid, liability_code, 'Loyalty points liability', 'liability', true)
+    on conflict (organization_id, code) do nothing;
+    select id into expense_account from public.books_accounts
+      where organization_id = organization_uuid and code = expense_code and type = 'expense';
+    select id into liability_account from public.books_accounts
+      where organization_id = organization_uuid and code = liability_code and type = 'liability';
+    if expense_account is null or liability_account is null then
+      raise exception 'The loyalty expense or liability account is configured with an incompatible account type';
+    end if;
 
-  if entry_row.points_delta > 0 then
-    debit_code := '5105';
-    credit_code := '2600';
-  else
-    debit_code := '2600';
-    credit_code := '5105';
-  end if;
-  journal_uuid := public.post_books_journal_entry(
-    organization_uuid, 'loyalty_points', entry_row.id, entry_row.created_at::date,
-    entry_row.description, debit_code, credit_code, posting_amount, 'UGX', organization_owner
-  );
-  update public.loyalty_books_postings
-     set organization_id = organization_uuid, status = 'posted',
-         journal_transaction_id = journal_uuid, error_message = null, updated_at = now()
-   where ledger_entry_id = entry_row.id;
-exception when others then
-  update public.loyalty_books_postings
-     set organization_id = organization_uuid, status = 'failed',
-         error_message = left(sqlerrm, 1000), updated_at = now()
-   where ledger_entry_id = target_entry_id;
+    if entry_row.points_delta > 0 then
+      debit_code := expense_code;
+      credit_code := liability_code;
+    else
+      debit_code := liability_code;
+      credit_code := expense_code;
+    end if;
+    journal_uuid := public.post_books_journal_entry(
+      organization_uuid, 'loyalty_points', entry_row.id, entry_row.created_at::date,
+      entry_row.description, debit_code, credit_code, posting_amount, 'UGX', organization_owner
+    );
+    update public.loyalty_books_postings
+       set organization_id = organization_uuid, status = 'posted',
+           journal_transaction_id = journal_uuid, error_message = null, updated_at = now()
+     where ledger_entry_id = entry_row.id;
+  exception when others then
+    update public.loyalty_books_postings
+       set organization_id = organization_uuid, status = 'failed',
+           error_message = left(sqlerrm, 1000), updated_at = now()
+     where ledger_entry_id = target_entry_id;
+  end;
 end;
 $$;
 revoke all on function public.post_loyalty_ledger_entry_to_books(uuid) from public, anon, authenticated;
@@ -330,7 +385,13 @@ declare supplied_code text; inviter_user_id uuid;
 begin
   if auth.uid() is null then raise exception 'Sign in to manage rewards enrollment'; end if;
   update public.loyalty_accounts
-     set is_enrolled = target_enrolled, updated_at = now()
+     set is_enrolled = target_enrolled,
+         enrolled_at = case
+           when target_enrolled and is_enrolled then enrolled_at
+           when target_enrolled then now()
+           else null
+         end,
+         updated_at = now()
    where user_id = auth.uid();
   if not found then raise exception 'Loyalty account was not initialized'; end if;
   if target_enrolled then
@@ -360,9 +421,10 @@ declare
 begin
   loop
     generated_code := 'SP-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 12));
-    insert into public.loyalty_accounts (user_id, referral_code, is_enrolled, signup_referral_code)
+    insert into public.loyalty_accounts (user_id, referral_code, is_enrolled, enrolled_at, signup_referral_code)
     values (
       new.id, generated_code, coalesce(new.raw_user_meta_data->>'loyalty_program', 'false') = 'true',
+      case when coalesce(new.raw_user_meta_data->>'loyalty_program', 'false') = 'true' then now() else null end,
       nullif(upper(trim(new.raw_user_meta_data->>'referral_code')), '')
     )
     on conflict (referral_code) do nothing;
@@ -415,6 +477,7 @@ declare
   ugx_amount numeric(20,4);
   awarded_points bigint;
   entry_uuid uuid;
+  account_row public.loyalty_accounts%rowtype;
 begin
   select * into queue_row from public.loyalty_award_queue where id = target_queue_id for update;
   if not found or queue_row.status <> 'pending_fx' then return; end if;
@@ -423,8 +486,15 @@ begin
     update public.loyalty_award_queue set error_message = 'Rewards are awaiting Books configuration and activation' where id = target_queue_id;
     return;
   end if;
-  if not exists (select 1 from public.loyalty_accounts where user_id = queue_row.user_id and is_enrolled) then
-    update public.loyalty_award_queue set status = 'excluded', error_message = 'The member is not enrolled in rewards', processed_at = now()
+  select * into account_row from public.loyalty_accounts where user_id = queue_row.user_id for update;
+  if not found then
+    update public.loyalty_award_queue set status = 'failed', error_message = 'The member rewards account is not initialized', processed_at = now()
+     where id = target_queue_id;
+    return;
+  end if;
+  if not account_row.is_enrolled or account_row.enrolled_at is null
+     or queue_row.created_at < account_row.enrolled_at then
+    update public.loyalty_award_queue set status = 'excluded', error_message = 'Rewards enrollment was not active when the purchase was verified', processed_at = now()
      where id = target_queue_id;
     return;
   end if;
@@ -488,15 +558,52 @@ $$;
 revoke all on function public.process_pending_loyalty_awards() from public, anon, authenticated;
 grant execute on function public.process_pending_loyalty_awards() to service_role;
 
+create or replace function public.retry_failed_loyalty_award(target_queue_id uuid)
+returns text language plpgsql security definer set search_path = pg_catalog, public
+as $$
+declare current_status text;
+begin
+  if auth.role() <> 'service_role' then raise exception 'Only the service role may retry loyalty awards'; end if;
+  update public.loyalty_award_queue
+     set status = 'pending_fx', processed_at = null, error_message = null
+   where id = target_queue_id and status = 'failed';
+  if found then perform public.process_loyalty_award_queue_entry(target_queue_id); end if;
+  select status into current_status from public.loyalty_award_queue where id = target_queue_id;
+  return coalesce(current_status, 'not_found');
+end;
+$$;
+revoke all on function public.retry_failed_loyalty_award(uuid) from public, anon, authenticated;
+grant execute on function public.retry_failed_loyalty_award(uuid) to service_role;
+
 create or replace function public.activate_loyalty_awards_after_configuration()
 returns trigger language plpgsql security definer set search_path = pg_catalog, public
 as $$
 begin
-  if new.program_enabled and not old.program_enabled then
+  if new.program_enabled and (
+    not old.program_enabled
+    or new.books_organization_id is distinct from old.books_organization_id
+    or new.books_expense_account_code is distinct from old.books_expense_account_code
+    or new.books_liability_account_code is distinct from old.books_liability_account_code
+  ) then
     if new.books_organization_id is null or not exists (
-      select 1 from public.books_organizations where id = new.books_organization_id
+      select 1 from public.books_organizations
+       where id = new.books_organization_id and upper(base_currency) = 'UGX'
     ) then
-      raise exception 'Select the platform-owned Books organization before activating rewards';
+      raise exception 'Select the platform-owned UGX Books organization before activating rewards';
+    end if;
+    insert into public.books_accounts (organization_id, code, name, type, is_system)
+    values
+      (new.books_organization_id, new.books_expense_account_code, 'Loyalty rewards expense', 'expense', true),
+      (new.books_organization_id, new.books_liability_account_code, 'Loyalty points liability', 'liability', true)
+    on conflict (organization_id, code) do nothing;
+    if not exists (
+      select 1 from public.books_accounts where organization_id = new.books_organization_id
+        and code = new.books_expense_account_code and type = 'expense'
+    ) or not exists (
+      select 1 from public.books_accounts where organization_id = new.books_organization_id
+        and code = new.books_liability_account_code and type = 'liability'
+    ) then
+      raise exception 'Configured Books account codes must map to expense and liability accounts';
     end if;
     perform public.process_pending_loyalty_awards();
   end if;
@@ -506,7 +613,8 @@ $$;
 revoke all on function public.activate_loyalty_awards_after_configuration() from public, anon, authenticated;
 drop trigger if exists activate_loyalty_awards_after_configuration on public.loyalty_program_settings;
 create trigger activate_loyalty_awards_after_configuration
-  after update of program_enabled on public.loyalty_program_settings
+  after update of program_enabled, books_organization_id, books_expense_account_code, books_liability_account_code
+  on public.loyalty_program_settings
   for each row execute function public.activate_loyalty_awards_after_configuration();
 
 create or replace function public.retry_loyalty_awards_after_fx_update()
@@ -633,10 +741,24 @@ declare
   bonus_invitee integer;
   profile_role text;
   valid_milestone boolean := false;
+  purchase_created_at timestamptz;
+  referral_minimum numeric;
 begin
   if target_qualification_type = 'purchase' then
-    select (target_purchase_ugx >= settings.guest_referral_minimum_ugx)
-      into valid_milestone from public.loyalty_program_settings settings where settings.id = true;
+    select created_at into purchase_created_at
+      from public.loyalty_award_queue
+     where user_id = target_user_id and source_type = target_source_type
+       and source_id = target_source_id and status = 'posted';
+    select guest_referral_minimum_ugx into referral_minimum
+      from public.loyalty_program_settings where id = true;
+    valid_milestone := coalesce(target_purchase_ugx >= referral_minimum, false)
+      and purchase_created_at is not null
+      and not exists (
+        select 1 from public.loyalty_award_queue earlier_purchase
+         where earlier_purchase.user_id = target_user_id
+           and earlier_purchase.source_type in ('menu_order', 'hotel_booking', 'special_event_payment')
+           and earlier_purchase.created_at < purchase_created_at
+      );
   elsif target_qualification_type = 'task' then
     select exists (
       select 1 from public.task_reports report
@@ -668,6 +790,7 @@ begin
   if target_qualification_type = 'purchase' and profile_role is distinct from 'guest' then return; end if;
   if target_qualification_type in ('task', 'manager_listing') and profile_role not in ('manager', 'service_provider') then return; end if;
 
+  perform 1 from public.loyalty_accounts where user_id = target_user_id for update;
   select * into referral_row from public.loyalty_referrals
    where referred_user_id = target_user_id and status = 'pending' for update;
   if not found then return; end if;
@@ -811,58 +934,135 @@ create trigger qualify_manager_listing_referral
   after insert or update of status on public.hotel_rooms
   for each row execute function public.qualify_manager_listing_referral();
 
--- Step 7: reverse event purchase awards and referral bonuses on an approved full event refund.
-create or replace function public.reverse_refunded_event_loyalty()
-returns trigger language plpgsql security definer set search_path = pg_catalog, public
+-- Step 7: reverse full purchase awards and qualifying referral bonuses after full refunds or chargebacks.
+-- Partial refunds are not prorated because menu and hotel flows do not persist a refund amount ledger.
+alter table public.loyalty_award_queue drop constraint if exists loyalty_award_queue_status_check;
+alter table public.loyalty_award_queue
+  add constraint loyalty_award_queue_status_check
+  check (status in ('pending_fx', 'posted', 'excluded', 'failed', 'refunded', 'reversed'));
+
+create or replace function public.reverse_loyalty_purchase_effects(
+  target_source_type text,
+  target_source_id uuid,
+  target_reversal_source_type text,
+  target_queue_status text
+)
+returns void language plpgsql security definer set search_path = pg_catalog, public
 as $$
 declare
   queue_row public.loyalty_award_queue%rowtype;
   referral_row public.loyalty_referrals%rowtype;
 begin
-  if new.status <> 'refunded' or (tg_op = 'UPDATE' and old.status = 'refunded') then return new; end if;
+  if target_queue_status not in ('refunded', 'reversed') then
+    raise exception 'Invalid loyalty reversal status';
+  end if;
+
   select * into queue_row from public.loyalty_award_queue
-   where source_type = 'special_event_payment' and source_id = new.id for update;
-  if found and queue_row.status = 'posted' and queue_row.points_awarded > 0 then
+   where source_type = target_source_type and source_id = target_source_id for update;
+  if not found then return; end if;
+
+  if queue_row.status = 'posted' and queue_row.points_awarded > 0 then
     perform public.apply_loyalty_points_delta(
       queue_row.user_id, 'purchase_reversal', -queue_row.points_awarded,
-      'event_refund', new.id, 'Reversal of refunded event purchase reward'
+      target_reversal_source_type, target_source_id, 'Reversal of refunded or charged-back purchase reward'
     );
-    update public.loyalty_award_queue set status = 'refunded', processed_at = now() where id = queue_row.id;
-  elsif found and queue_row.status = 'pending_fx' then
-    update public.loyalty_award_queue set status = 'refunded', processed_at = now(), error_message = 'Purchase refunded before points were awarded' where id = queue_row.id;
+  end if;
+  if queue_row.status in ('posted', 'pending_fx', 'failed') then
+    update public.loyalty_award_queue
+       set status = target_queue_status, processed_at = now(),
+           error_message = case when target_queue_status = 'refunded' then 'Purchase refunded' else 'Purchase charged back' end
+     where id = queue_row.id;
   end if;
 
   select * into referral_row from public.loyalty_referrals
-   where status = 'qualified' and qualification_source_type = 'special_event_payment'
-     and qualification_source_id = new.id for update;
+   where status = 'qualified' and qualification_source_type = target_source_type
+     and qualification_source_id = target_source_id for update;
   if found then
     perform public.apply_loyalty_points_delta(
       referral_row.referrer_user_id, 'referral_reversal', -referral_row.referrer_points,
-      'referral_refund', referral_row.id, 'Reversal of referral reward after qualifying purchase refund'
+      'referral_refund', referral_row.id, 'Reversal of referral reward after qualifying purchase reversal'
     );
     perform public.apply_loyalty_points_delta(
       referral_row.referred_user_id, 'referral_reversal', -referral_row.invitee_points,
-      'referral_refund', referral_row.id, 'Reversal of referral welcome reward after qualifying purchase refund'
+      'referral_refund', referral_row.id, 'Reversal of referral welcome reward after qualifying purchase reversal'
     );
     update public.loyalty_referrals set status = 'cancelled' where id = referral_row.id;
+  end if;
+end;
+$$;
+revoke all on function public.reverse_loyalty_purchase_effects(text, uuid, text, text) from public, anon, authenticated;
+
+create or replace function public.reverse_loyalty_after_order_refund()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public
+as $$
+declare
+  source_type_value text;
+  reversal_type_value text;
+  queue_status_value text;
+begin
+  if new.payment_status not in ('refunded', 'chargeback')
+     or old.payment_status is not distinct from new.payment_status then
+    return new;
+  end if;
+  if tg_table_name = 'menu_orders' then
+    source_type_value := 'menu_order';
+  else
+    source_type_value := 'hotel_booking';
+  end if;
+  reversal_type_value := source_type_value || '_reversal';
+  queue_status_value := case when new.payment_status = 'refunded' then 'refunded' else 'reversed' end;
+  perform public.reverse_loyalty_purchase_effects(source_type_value, new.id, reversal_type_value, queue_status_value);
+  return new;
+end;
+$$;
+revoke all on function public.reverse_loyalty_after_order_refund() from public, anon, authenticated;
+drop trigger if exists reverse_menu_order_loyalty_refund on public.menu_orders;
+create trigger reverse_menu_order_loyalty_refund
+  after update of payment_status on public.menu_orders
+  for each row execute function public.reverse_loyalty_after_order_refund();
+drop trigger if exists reverse_hotel_booking_loyalty_refund on public.hotel_bookings;
+create trigger reverse_hotel_booking_loyalty_refund
+  after update of payment_status on public.hotel_bookings
+  for each row execute function public.reverse_loyalty_after_order_refund();
+
+create or replace function public.reverse_special_event_loyalty()
+returns trigger language plpgsql security definer set search_path = pg_catalog, public
+as $$
+begin
+  if new.status in ('refunded', 'chargeback') and old.status is distinct from new.status then
+    perform public.reverse_loyalty_purchase_effects(
+      'special_event_payment', new.id, 'special_event_payment_reversal',
+      case when new.status = 'refunded' then 'refunded' else 'reversed' end
+    );
   end if;
   return new;
 end;
 $$;
-revoke all on function public.reverse_refunded_event_loyalty() from public, anon, authenticated;
+revoke all on function public.reverse_special_event_loyalty() from public, anon, authenticated;
 drop trigger if exists reverse_refunded_event_loyalty on public.special_event_payments;
-create trigger reverse_refunded_event_loyalty
+drop trigger if exists reverse_special_event_loyalty on public.special_event_payments;
+create trigger reverse_special_event_loyalty
   after update of status on public.special_event_payments
-  for each row execute function public.reverse_refunded_event_loyalty();
+  for each row execute function public.reverse_special_event_loyalty();
 
--- Step 8: activate only after selecting the platform-owned Books organization.
--- First inspect candidate organizations and confirm the central platform entity:
--- select id, name, country_code, base_currency, owner_id from public.books_organizations order by created_at;
--- Set its UUID from the reviewed results, while program_enabled remains false:
--- update public.loyalty_program_settings set books_organization_id = '<platform-books-organization-uuid>' where id = true;
--- Activate only after the 5105 expense and 2600 liability accounts are confirmed in that Books organization.
--- The activation trigger rejects a missing/invalid Books organization and retries pending verified awards.
--- update public.loyalty_program_settings set program_enabled = true where id = true;
+-- Step 8: propose the configured Books sales organization, but leave rewards disabled for Finance approval.
+update public.loyalty_program_settings settings
+   set books_organization_id = sales.organization_id, updated_at = now()
+  from public.books_menu_sales_settings sales
+  join public.books_organizations organization on organization.id = sales.organization_id
+ where settings.id = true and sales.id = true
+   and upper(organization.base_currency) = 'UGX'
+   and settings.books_organization_id is null;
+
+-- Verify the organization is platform-owned, uses UGX, and the expense/liability codes are appropriate:
+-- select settings.program_enabled, organization.id, organization.name, organization.owner_id,
+--        organization.base_currency, settings.books_expense_account_code, settings.books_liability_account_code
+--   from public.loyalty_program_settings settings
+--   left join public.books_organizations organization on organization.id = settings.books_organization_id
+--  where settings.id = true;
+-- Only after Finance approves that mapping, activate with:
+-- update public.loyalty_program_settings set program_enabled = true, updated_at = now() where id = true;
+-- Activation validates the UGX organization and account types before processing queued purchases.
 -- Redemption remains disabled until merchant settlement and redemption accounting are implemented.
 
 -- Step 9: useful indexes and schema refresh after reviewing the SQL and applying it.
@@ -876,3 +1076,5 @@ notify pgrst, 'reload schema';
 -- select count(*) from public.loyalty_ledger_entries where points_delta < 0;
 -- Redemption is intentionally disabled; do not change redemption_enabled until seller-funded
 -- vs platform-funded discount accounting and bank/processor settlement are implemented and tested.
+
+commit;
